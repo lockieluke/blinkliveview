@@ -786,8 +786,21 @@ class OnDemandStreamServer:
             self.camera.camera_id,
             camera_type=self.camera.camera_type,
         )
+
+        if self.verbose:
+            print(f"[{_get_timestamp()}] Liveview API response: {response}")
+
+        if not response:
+            raise RuntimeError("Empty response from Blink liveview API")
+
+        if "server" not in response:
+            # Check for error message in response
+            if "message" in response:
+                raise RuntimeError(f"Blink API error: {response['message']}")
+            raise RuntimeError(f"Unexpected API response (no 'server' key): {response}")
+
         if not response["server"].startswith("immis://"):
-            raise NotImplementedError(f"Unsupported: {response['server']}")
+            raise NotImplementedError(f"Unsupported protocol: {response['server']}")
 
         return OnDemandLiveStream(self, response)
 
@@ -859,14 +872,29 @@ class OnDemandLiveStream:
         ssl_context.check_hostname = False
         ssl_context.verify_mode = ssl.CERT_NONE
 
-        self.target_reader, self.target_writer = await asyncio.open_connection(
-            self.target.hostname, self.target.port, ssl=ssl_context
+        print(
+            f"[{_get_timestamp()}] Connecting to Blink server: {self.target.hostname}:{self.target.port}"
         )
+
+        try:
+            self.target_reader, self.target_writer = await asyncio.wait_for(
+                asyncio.open_connection(
+                    self.target.hostname, self.target.port, ssl=ssl_context
+                ),
+                timeout=10.0,
+            )
+        except Exception as e:
+            print(f"[{_get_timestamp()}] Failed to connect to Blink server: {e}")
+            raise
+
+        print(f"[{_get_timestamp()}] Connected to Blink server, sending auth...")
 
         # Send auth header
         auth_header = self._get_auth_header()
         self.target_writer.write(auth_header)
         await self.target_writer.drain()
+
+        print(f"[{_get_timestamp()}] Auth sent, starting to receive stream data...")
 
         try:
             await asyncio.gather(self._recv(), self._send_keepalive(), self._poll())
@@ -880,6 +908,8 @@ class OnDemandLiveStream:
         """Receive data from Blink and forward to clients."""
         consecutive_errors = 0
         max_errors = 10
+        packets_received = 0
+        packets_forwarded = 0
 
         while not self._stop_requested and not self.target_reader.at_eof():
             try:
@@ -891,10 +921,12 @@ class OnDemandLiveStream:
                 if len(header) < 9:
                     consecutive_errors += 1
                     if consecutive_errors >= max_errors:
+                        print(f"[{_get_timestamp()}] Too many header errors, stopping")
                         break
                     continue
 
                 consecutive_errors = 0
+                packets_received += 1
                 msgtype = header[0]
                 payload_length = int.from_bytes(header[5:9], byteorder="big")
 
@@ -911,22 +943,44 @@ class OnDemandLiveStream:
                     continue
 
                 # Forward to all connected clients
+                clients_count = len(self.server.clients)
                 for writer in list(self.server.clients):
                     if not writer.is_closing():
                         try:
                             writer.write(payload)
                             await writer.drain()
-                        except Exception:
-                            pass
+                        except Exception as e:
+                            if self.server.verbose:
+                                print(
+                                    f"[{_get_timestamp()}] Error writing to client: {e}"
+                                )
+
+                packets_forwarded += 1
+                if packets_forwarded == 1:
+                    print(
+                        f"[{_get_timestamp()}] First video packet forwarded to {clients_count} client(s)"
+                    )
+                elif packets_forwarded % 500 == 0:
+                    print(
+                        f"[{_get_timestamp()}] Forwarded {packets_forwarded} packets to {clients_count} client(s)"
+                    )
 
                 await asyncio.sleep(0)
 
             except asyncio.TimeoutError:
                 consecutive_errors += 1
+                print(
+                    f"[{_get_timestamp()}] Timeout waiting for data ({consecutive_errors}/{max_errors})"
+                )
                 if consecutive_errors >= max_errors:
                     break
-            except Exception:
+            except Exception as e:
+                print(f"[{_get_timestamp()}] Receive error: {e}")
                 break
+
+        print(
+            f"[{_get_timestamp()}] Stream ended. Received {packets_received} packets, forwarded {packets_forwarded}"
+        )
 
     async def _read_exact(self, length):
         """Read exact number of bytes."""
