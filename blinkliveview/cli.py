@@ -710,7 +710,7 @@ class OnDemandStreamServer:
                         if self.clients and not self._stopping:
                             print(f"[{_get_timestamp()}] Stream ended, restarting...")
                             await self._stop_stream()
-                            await asyncio.sleep(2)
+                            await asyncio.sleep(1)
                             await self._start_stream()
 
                 await asyncio.sleep(0.5)
@@ -967,7 +967,7 @@ class OnDemandLiveStream:
             self.stop()
 
     async def _health_monitor(self):
-        """Monitor connection health and log statistics."""
+        """Monitor connection health and trigger reconnection if stale."""
         import time
 
         while not self._stop_requested:
@@ -980,8 +980,12 @@ class OnDemandLiveStream:
             seconds_since_packet = time.monotonic() - self._last_packet_time
             if seconds_since_packet > self.PACKET_TIMEOUT:
                 print(
-                    f"[{_get_timestamp()}] No packets for {seconds_since_packet:.1f}s, connection may be stale"
+                    f"[{_get_timestamp()}] No packets for {seconds_since_packet:.1f}s, "
+                    f"connection stale - stopping stream for restart"
                 )
+                # Stop the stream to trigger server restart
+                self.stop()
+                break
 
             # Log periodic stats
             if self._packets_forwarded > 0 and self._packets_forwarded % 1000 == 0:
