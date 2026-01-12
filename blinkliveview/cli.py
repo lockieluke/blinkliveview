@@ -345,6 +345,8 @@ async def stream_camera(
                 "-sync",
                 "ext",
                 "-infbuf",
+                "-loglevel",
+                "warning",
             ]
 
             # Add user-specified args (but filter out duplicates)
@@ -363,11 +365,16 @@ async def stream_camera(
             # Wait a moment for the stream to initialize
             await asyncio.sleep(1.5)
 
+            # Suppress SDL debug messages
+            env = os.environ.copy()
+            env["SDL_LOG_PRIORITY"] = "critical"
+
             # Start ffplay as subprocess
             ffplay_proc = subprocess.Popen(
                 ffplay_cmd,
                 stdout=subprocess.DEVNULL if not verbose else None,
-                stderr=subprocess.PIPE if not verbose else None,
+                stderr=subprocess.DEVNULL if not verbose else None,
+                env=env,
             )
 
             # Wait for either ffplay to exit or the feed to end
@@ -806,19 +813,51 @@ class OnDemandStreamServer:
 
 
 class OnDemandLiveStream:
-    """Livestream that forwards data to the OnDemandStreamServer's clients."""
+    """Livestream that forwards data to the OnDemandStreamServer's clients.
+
+    Optimized for stream stability with:
+    - Packet buffering to smooth network jitter
+    - Batched client writes for efficiency
+    - Slow client detection and graceful degradation
+    - Increased error tolerance
+    - Connection health monitoring
+    """
+
+    # Configuration constants
+    BUFFER_SIZE = 50  # Packets to buffer for jitter smoothing
+    BUFFER_LOW_WATERMARK = 10  # Start sending when buffer reaches this
+    MAX_CONSECUTIVE_ERRORS = 15  # More tolerance before giving up
+    PACKET_TIMEOUT = 15.0  # Timeout for receiving packets
+    PAYLOAD_TIMEOUT = 8.0  # Timeout for reading payload
+    SLOW_CLIENT_THRESHOLD = 100  # Drop packets if client buffer exceeds this
+    SOCKET_BUFFER_SIZE = 262144  # 256KB socket buffer
 
     def __init__(self, server: OnDemandStreamServer, response):
+        import collections
+        import urllib.parse
+
         self.server = server
         self.camera = server.camera
         self.command_id = response["command_id"]
         self.polling_interval = response["polling_interval"]
-        self.target = __import__("urllib.parse", fromlist=["urlparse"]).urlparse(
-            response["server"]
-        )
+        self.target = urllib.parse.urlparse(response["server"])
         self.target_reader = None
         self.target_writer = None
         self._stop_requested = False
+
+        # Packet buffer for jitter smoothing
+        self._packet_buffer = collections.deque(maxlen=self.BUFFER_SIZE)
+        self._buffer_lock = asyncio.Lock()
+        self._buffer_event = asyncio.Event()
+
+        # Client write tracking for slow client handling
+        self._client_pending_writes: dict = {}
+
+        # Statistics
+        self._packets_received = 0
+        self._packets_forwarded = 0
+        self._packets_dropped = 0
+        self._last_packet_time = 0.0
 
     def _get_auth_header(self):
         """Get authentication header for Blink stream."""
@@ -866,7 +905,9 @@ class OnDemandLiveStream:
 
     async def feed(self):
         """Connect to Blink and stream data to all connected clients."""
+        import socket
         import ssl
+        import time
 
         ssl_context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
         ssl_context.check_hostname = False
@@ -883,6 +924,18 @@ class OnDemandLiveStream:
                 ),
                 timeout=10.0,
             )
+
+            # Optimize socket settings
+            sock = self.target_writer.get_extra_info("socket")
+            if sock:
+                try:
+                    sock.setsockopt(
+                        socket.SOL_SOCKET, socket.SO_RCVBUF, self.SOCKET_BUFFER_SIZE
+                    )
+                    sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+                except Exception:
+                    pass
+
         except Exception as e:
             print(f"[{_get_timestamp()}] Failed to connect to Blink server: {e}")
             raise
@@ -896,37 +949,81 @@ class OnDemandLiveStream:
 
         print(f"[{_get_timestamp()}] Auth sent, starting to receive stream data...")
 
+        # Initialize timing
+        self._last_packet_time = time.monotonic()
+
         try:
-            await asyncio.gather(self._recv(), self._send_keepalive(), self._poll())
+            await asyncio.gather(
+                self._recv(),
+                self._distribute_packets(),
+                self._send_keepalive(),
+                self._poll(),
+                self._health_monitor(),
+            )
         except Exception as e:
             if self.server.verbose:
                 print(f"[{_get_timestamp()}] Stream error: {e}")
         finally:
             self.stop()
 
+    async def _health_monitor(self):
+        """Monitor connection health and log statistics."""
+        import time
+
+        while not self._stop_requested:
+            await asyncio.sleep(5.0)
+
+            if self._stop_requested:
+                break
+
+            # Check for stale connection
+            seconds_since_packet = time.monotonic() - self._last_packet_time
+            if seconds_since_packet > self.PACKET_TIMEOUT:
+                print(
+                    f"[{_get_timestamp()}] No packets for {seconds_since_packet:.1f}s, connection may be stale"
+                )
+
+            # Log periodic stats
+            if self._packets_forwarded > 0 and self._packets_forwarded % 1000 == 0:
+                drop_rate = (
+                    self._packets_dropped
+                    / (self._packets_received + self._packets_dropped)
+                    * 100
+                    if (self._packets_received + self._packets_dropped) > 0
+                    else 0
+                )
+                print(
+                    f"[{_get_timestamp()}] Stats: {self._packets_forwarded} forwarded, "
+                    f"{self._packets_dropped} dropped ({drop_rate:.1f}%), "
+                    f"buffer: {len(self._packet_buffer)}"
+                )
+
     async def _recv(self):
-        """Receive data from Blink and forward to clients."""
+        """Receive data from Blink and buffer for distribution."""
+        import time
+
         consecutive_errors = 0
-        max_errors = 10
-        packets_received = 0
-        packets_forwarded = 0
 
         while not self._stop_requested and not self.target_reader.at_eof():
             try:
                 # Read header
                 header = await asyncio.wait_for(
-                    self.target_reader.read(9), timeout=10.0
+                    self.target_reader.read(9), timeout=self.PACKET_TIMEOUT
                 )
 
                 if len(header) < 9:
                     consecutive_errors += 1
-                    if consecutive_errors >= max_errors:
+                    if consecutive_errors >= self.MAX_CONSECUTIVE_ERRORS:
                         print(f"[{_get_timestamp()}] Too many header errors, stopping")
                         break
+                    if len(header) == 0:
+                        await asyncio.sleep(0.05)
                     continue
 
                 consecutive_errors = 0
-                packets_received += 1
+                self._packets_received += 1
+                self._last_packet_time = time.monotonic()
+
                 msgtype = header[0]
                 payload_length = int.from_bytes(header[5:9], byteorder="big")
 
@@ -936,61 +1033,135 @@ class OnDemandLiveStream:
                 # Read payload
                 payload = await self._read_exact(payload_length)
                 if payload is None:
+                    self._packets_dropped += 1
                     continue
 
-                # Only forward video packets (msgtype 0x00) starting with 0x47
+                # Only buffer video packets (msgtype 0x00) starting with 0x47
                 if msgtype != 0x00 or payload[0] != 0x47:
                     continue
 
-                # Forward to all connected clients
-                clients_count = len(self.server.clients)
-                for writer in list(self.server.clients):
-                    if not writer.is_closing():
-                        try:
-                            writer.write(payload)
-                            await writer.drain()
-                        except Exception as e:
-                            if self.server.verbose:
-                                print(
-                                    f"[{_get_timestamp()}] Error writing to client: {e}"
-                                )
-
-                packets_forwarded += 1
-                if packets_forwarded == 1:
-                    print(
-                        f"[{_get_timestamp()}] First video packet forwarded to {clients_count} client(s)"
-                    )
-                elif packets_forwarded % 500 == 0:
-                    print(
-                        f"[{_get_timestamp()}] Forwarded {packets_forwarded} packets to {clients_count} client(s)"
-                    )
-
-                await asyncio.sleep(0)
+                # Add to buffer
+                async with self._buffer_lock:
+                    self._packet_buffer.append(payload)
+                    self._buffer_event.set()
 
             except asyncio.TimeoutError:
                 consecutive_errors += 1
-                print(
-                    f"[{_get_timestamp()}] Timeout waiting for data ({consecutive_errors}/{max_errors})"
-                )
-                if consecutive_errors >= max_errors:
+                if self.server.verbose:
+                    print(
+                        f"[{_get_timestamp()}] Timeout waiting for data "
+                        f"({consecutive_errors}/{self.MAX_CONSECUTIVE_ERRORS})"
+                    )
+                if consecutive_errors >= self.MAX_CONSECUTIVE_ERRORS:
                     break
             except Exception as e:
                 print(f"[{_get_timestamp()}] Receive error: {e}")
                 break
 
         print(
-            f"[{_get_timestamp()}] Stream ended. Received {packets_received} packets, forwarded {packets_forwarded}"
+            f"[{_get_timestamp()}] Stream ended. Received {self._packets_received} packets, "
+            f"forwarded {self._packets_forwarded}, dropped {self._packets_dropped}"
         )
 
+    async def _distribute_packets(self):
+        """Distribute buffered packets to clients with batching."""
+        # Wait for initial buffer fill for smoother start
+        initial_wait = 0
+        while (
+            len(self._packet_buffer) < self.BUFFER_LOW_WATERMARK
+            and not self._stop_requested
+            and initial_wait < 3.0
+        ):
+            await asyncio.sleep(0.1)
+            initial_wait += 0.1
+
+        if self.server.verbose:
+            print(
+                f"[{_get_timestamp()}] Starting distribution (buffer: {len(self._packet_buffer)})"
+            )
+
+        first_packet_logged = False
+
+        while not self._stop_requested:
+            # Wait for data
+            try:
+                await asyncio.wait_for(self._buffer_event.wait(), timeout=1.0)
+            except asyncio.TimeoutError:
+                continue
+
+            # Get batch of packets
+            async with self._buffer_lock:
+                packets = []
+                for _ in range(min(10, len(self._packet_buffer))):
+                    if self._packet_buffer:
+                        packets.append(self._packet_buffer.popleft())
+                if not self._packet_buffer:
+                    self._buffer_event.clear()
+
+            if not packets:
+                continue
+
+            # Combine packets for batch write
+            combined_data = b"".join(packets)
+            clients_count = len(self.server.clients)
+
+            # Forward to all clients
+            for writer in list(self.server.clients):
+                if writer.is_closing():
+                    continue
+
+                client_id = id(writer)
+                pending = self._client_pending_writes.get(client_id, 0)
+
+                # Handle slow clients
+                if pending > self.SLOW_CLIENT_THRESHOLD:
+                    self._packets_dropped += len(packets)
+                    if self.server.verbose:
+                        print(
+                            f"[{_get_timestamp()}] Dropping packets for slow client "
+                            f"(pending: {pending})"
+                        )
+                    continue
+
+                try:
+                    writer.write(combined_data)
+                    self._client_pending_writes[client_id] = pending + len(packets)
+
+                    # Drain periodically
+                    if pending > 20:
+                        await writer.drain()
+                        self._client_pending_writes[client_id] = 0
+
+                except Exception as e:
+                    if self.server.verbose:
+                        print(f"[{_get_timestamp()}] Error writing to client: {e}")
+
+            self._packets_forwarded += len(packets)
+
+            if not first_packet_logged:
+                print(
+                    f"[{_get_timestamp()}] First video packet forwarded to "
+                    f"{clients_count} client(s)"
+                )
+                first_packet_logged = True
+            elif self._packets_forwarded % 500 == 0:
+                print(
+                    f"[{_get_timestamp()}] Forwarded {self._packets_forwarded} packets "
+                    f"to {clients_count} client(s)"
+                )
+
+            await asyncio.sleep(0)
+
     async def _read_exact(self, length):
-        """Read exact number of bytes."""
+        """Read exact number of bytes with larger chunks."""
         data = bytearray()
         remaining = length
 
         while remaining > 0:
             try:
                 chunk = await asyncio.wait_for(
-                    self.target_reader.read(min(remaining, 8192)), timeout=5.0
+                    self.target_reader.read(min(remaining, 16384)),
+                    timeout=self.PAYLOAD_TIMEOUT,
                 )
                 if not chunk:
                     return None
@@ -1058,7 +1229,6 @@ class OnDemandLiveStream:
                         + bytes([0x00, 0x00, 0x00, 0x00])
                     )
                     self.target_writer.write(keepalive)
-                    await self.target_writer.drain()
 
                 self.target_writer.write(latency_stats)
                 await self.target_writer.drain()
@@ -1069,13 +1239,16 @@ class OnDemandLiveStream:
                 break
 
     async def _poll(self):
-        """Poll Blink command API."""
+        """Poll Blink command API with timeout protection."""
         from blinkpy import api
 
         while not self._stop_requested:
             try:
-                response = await api.request_command_status(
-                    self.camera.sync.blink, self.camera.network_id, self.command_id
+                response = await asyncio.wait_for(
+                    api.request_command_status(
+                        self.camera.sync.blink, self.camera.network_id, self.command_id
+                    ),
+                    timeout=10.0,
                 )
 
                 if response.get("status_code", 0) != 908:
@@ -1086,6 +1259,10 @@ class OnDemandLiveStream:
                         if cmd.get("state_condition") not in ("new", "running"):
                             return
 
+                await asyncio.sleep(self.polling_interval)
+            except asyncio.TimeoutError:
+                if self.server.verbose:
+                    print(f"[{_get_timestamp()}] Command API poll timeout")
                 await asyncio.sleep(self.polling_interval)
             except Exception:
                 break
@@ -1101,8 +1278,11 @@ class OnDemandLiveStream:
             pass
 
     def stop(self):
-        """Stop the stream."""
+        """Stop the stream and cleanup."""
         self._stop_requested = True
+        self._packet_buffer.clear()
+        self._buffer_event.set()  # Unblock distribution task
+
         if self.target_writer and not self.target_writer.is_closing():
             self.target_writer.close()
 
